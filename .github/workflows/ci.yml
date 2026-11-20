@@ -1,0 +1,66 @@
+name: ci
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      big:
+        description: "events for the timing run (0 = skip)"
+        default: "20000000"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU
+        run: |
+          nproc; free -g; grep -m1 'model name' /proc/cpuinfo
+          grep -m1 -o 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+      - name: Build
+        run: |
+          cargo build --release --manifest-path engine/Cargo.toml
+          cargo build --release --manifest-path oracle/Cargo.toml
+          cargo build --release --manifest-path tools/generator/Cargo.toml
+          pip install -q polars pyarrow
+      - name: Engine tests
+        run: cargo test --release --manifest-path engine/Cargo.toml
+      - name: Fixtures (engine, oracle)
+        run: |
+          python3 scripts/run_fixtures.py fixtures -- engine/target/release/engine | tail -1
+          python3 scripts/run_fixtures.py fixtures -- oracle/target/release/oracle | tail -1
+          python3 scripts/run_fixtures.py fixtures -- engine/target/release/engine > /dev/null
+      - name: Dev answer
+        run: |
+          G=tools/generator/target/release/generate
+          $G --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          engine/target/release/engine /tmp/dev /tmp/dev_out
+          cd scripts && python3 compare.py /tmp/dev_out ../tests/dev-answer
+      - name: Seed sweep vs oracle
+        run: |
+          G=tools/generator/target/release/generate
+          for s in $(seq 100 130); do
+            e=$(( 50000 + (s * 7919) % 400000 )); c=$(( e * (s % 9) / 6 + 1000 ))
+            $G --seed $s --events $e --clicks $c --output /tmp/sw >/dev/null
+            rm -rf /tmp/a /tmp/b
+            engine/target/release/engine /tmp/sw /tmp/a
+            oracle/target/release/oracle /tmp/sw /tmp/b
+            r=$(cd scripts && python3 compare.py /tmp/a /tmp/b | tail -1)
+            echo "seed $s e=$e c=$c $r"; [ "$r" = MATCH ] || exit 1
+            rm -rf /tmp/sw
+          done
+      - name: Docker image fixtures
+        run: |
+          docker build -q -t shopping-sessions:latest .
+          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh | tail -1
+          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh > /dev/null
+      - name: Timing run vs oracle
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.big != '0' }}
+        run: |
+          G=tools/generator/target/release/generate
+          E=${{ inputs.big }}
+          $G --seed 77 --events $E --clicks $((E/4)) --output /tmp/big
+          du -sh /tmp/big
+          for i in 1 2 3; do rm -rf /tmp/big_out; /usr/bin/time -v env ENGINE_TIMING=1 engine/target/release/engine /tmp/big /tmp/big_out 2>&1 | grep -E 's |Elapsed|Maximum resident'; done
+          rm -rf /tmp/big_out; time scripts/docker_run.sh /tmp/big /tmp/big_out_docker
+          oracle/target/release/oracle /tmp/big /tmp/big_ref
+          cd scripts && python3 compare.py /tmp/big_out_docker /tmp/big_ref
