@@ -87,5 +87,5 @@ jobs:
             /tmp/tgt_dbg/release/engine --help >/dev/null 2>&1 || true
             tools/generator/target/release/generate --seed 5 --events 1500000 --clicks 375000 --output /tmp/small >/dev/null
             NCPU=1 valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out /tmp/tgt_dbg/release/engine /tmp/small /tmp/small_out 2>&1 | tail -2
-            callgrind_annotate /tmp/cg.out 2>/dev/null | head -40 | cut -c1-170
+            callgrind_annotate /tmp/cg.out 2>/dev/null | grep -E '^ *[0-9,]{9,} [(]' | head -30 | cut -c1-200
           fi
