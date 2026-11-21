@@ -91,3 +91,18 @@ jobs:
             NCPU=1 valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out /tmp/tgt_dbg/release/engine /tmp/small /tmp/small_out 2>&1 | tail -2
             callgrind_annotate /tmp/cg.out 2>/dev/null | grep -E '^ *[0-9,]{9,} [(]' | head -30 | cut -c1-200
           fi
+      - name: Knob sweep (NCPU=4)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.big != '0' }}
+        run: |
+          run() { rm -rf /tmp/big_out; env "$@" ENGINE_TIMING=1 NCPU=4 engine/target/release/engine /tmp/big /tmp/big_out 2>&1 | tr '\n' ' ' | awk -v k="$*" '{print k " => " $0}' | sed -E 's/[0-9.]+s small tables//; s/[0-9.]+s link edges//'; }
+          for rep in 1 2; do
+            run ENGINE_P1DIV=40000
+            run ENGINE_P1DIV=20000
+            run ENGINE_P1DIV=10000
+            run ENGINE_P1DIV=80000
+            run ENGINE_QDIV=30000
+            run ENGINE_QDIV=120000
+            run ENGINE_CHUNK_KB=2048
+            run ENGINE_CHUNK_KB=4096
+            run ENGINE_CHUNK_KB=16384
+          done

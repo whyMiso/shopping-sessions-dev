@@ -15,7 +15,9 @@ use ts::{parse_ts, parse_ts_c, DateCache, DAY_MS};
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
 const LATE_MS: i64 = DAY_MS;
-const CHUNK: u64 = 8 << 20;
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 const NONE_CAT: u32 = u32::MAX;
 
 // ---------------------------------------------------------------- hash table u64 -> u64
@@ -529,6 +531,7 @@ fn main() {
 
     let ncats = cats.len();
     // file lists and chunks
+    let chunk_bytes = env_u64("ENGINE_CHUNK_KB", 8192) << 10;
     let mut files: Vec<(PathBuf, u64)> = Vec::new();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut ev_bytes = 0u64;
@@ -541,7 +544,7 @@ fn main() {
             }
             let mut s = 0;
             while s < sz {
-                let e = (s + CHUNK).min(sz);
+                let e = (s + chunk_bytes).min(sz);
                 chunks.push(Chunk { file: fi, start: s, end: e, kind });
                 s = e;
             }
@@ -588,8 +591,8 @@ fn main() {
 
     // ---------------- parse events & clicks
     let est_rows = (ev_bytes / 70).max(1024);
-    let p1_bits = ((est_rows / 40_000).max(1).next_power_of_two().trailing_zeros()).min(12);
-    let q_bits = ((est_rows / 60_000).max(1).next_power_of_two().trailing_zeros()).clamp(4, 12);
+    let p1_bits = ((est_rows / env_u64("ENGINE_P1DIV", 40_000)).max(1).next_power_of_two().trailing_zeros()).min(12);
+    let q_bits = ((est_rows / env_u64("ENGINE_QDIV", 60_000)).max(1).next_power_of_two().trailing_zeros()).clamp(4, 12);
     let base = ws - WEEK_MS;
     if we - base >= (1i64 << 32) || ncats >= 255 {
         eprintln!("unsupported window/category count");
