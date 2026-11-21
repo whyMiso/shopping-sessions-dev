@@ -73,10 +73,19 @@ jobs:
           for n in 1 2 4; do echo "NCPU=$n"; rm -rf /tmp/big_out; NCPU=$n ENGINE_TIMING=1 engine/target/release/engine /tmp/big /tmp/big_out 2>&1 | tr '\n' ' '; echo; done
           lscpu | grep -E 'Thread|Core|Socket|L2|L3|MHz' | tr -s ' ' | tr '\n' ';'; echo
           cat /sys/kernel/mm/transparent_hugepage/enabled || true
+          sudo apt-get update -q >/dev/null 2>&1 || true
           sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -q linux-tools-generic >/dev/null 2>&1 || true
           cd engine && CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release --target-dir /tmp/tgt_dbg 2>&1 | tail -1; cd ..
           rm -rf /tmp/big_out
           P=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); echo "perf=$P"
           sudo sysctl kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
-          sudo $P record -e cpu-clock -F 2000 -o /tmp/perf.data /tmp/tgt_dbg/release/engine /tmp/big /tmp/big_out 2>&1 | tail -2 || true
-          sudo $P report -i /tmp/perf.data --stdio --no-children 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30 | cut -c1-150 || true
+          if [ -n "$P" ]; then
+            sudo $P record -e cpu-clock -F 2000 -o /tmp/perf.data /tmp/tgt_dbg/release/engine /tmp/big /tmp/big_out 2>&1 | tail -2 || true
+            sudo $P report -i /tmp/perf.data --stdio --no-children 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30 | cut -c1-150 || true
+          else
+            sudo apt-get install -y -q valgrind >/dev/null 2>&1 || true
+            /tmp/tgt_dbg/release/engine --help >/dev/null 2>&1 || true
+            tools/generator/target/release/generate --seed 5 --events 1500000 --clicks 375000 --output /tmp/small >/dev/null
+            NCPU=1 valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out /tmp/tgt_dbg/release/engine /tmp/small /tmp/small_out 2>&1 | tail -2
+            callgrind_annotate /tmp/cg.out 2>/dev/null | head -40 | cut -c1-170
+          fi
