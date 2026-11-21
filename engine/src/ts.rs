@@ -67,10 +67,44 @@ fn civil19(b: &[u8]) -> Option<i64> {
 
 /// Full validating parser. Returns epoch ms, or None for a bad form.
 /// F3 values that overflow i64 return None (they are outside any window).
+/// Value of an all-digit slice of length <= 18, or None if any byte is not an ASCII digit.
+#[inline]
+fn digits_fast(b: &[u8]) -> Option<u64> {
+    let n = b.len();
+    let mut v: u64 = 0;
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let t = w ^ 0x3030_3030_3030_3030;
+        if (t | t.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 != 0 {
+            return None;
+        }
+        let mut x = t.wrapping_mul(2561) >> 8;
+        x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+        x = (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
+        v = v * 100_000_000 + x;
+        i += 8;
+    }
+    while i < n {
+        let d = b[i].wrapping_sub(b'0');
+        if d >= 10 {
+            return None;
+        }
+        v = v * 10 + d as u64;
+        i += 1;
+    }
+    Some(v)
+}
+
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 {
         return None;
+    }
+    if n <= 18 {
+        if let Some(v) = digits_fast(b) {
+            return Some(v as i64);
+        }
     }
     // F3: digits only.
     if b.iter().all(|c| c.is_ascii_digit()) {
@@ -168,12 +202,24 @@ pub fn parse_ts_c(b: &[u8], c: &mut DateCache) -> Option<i64> {
             None => return None,
         }
     };
-    if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b[10] != b'T' {
         return None;
     }
-    let h = d2(b, 11)?;
-    let mi = d2(b, 14)?;
-    let s = d2(b, 17)?;
+    // "HH:MM:SS" as one word: colons at bytes 2 and 5, digits elsewhere.
+    let w = u64::from_le_bytes(b[11..19].try_into().unwrap());
+    let t = w ^ 0x3030_3030_3030_3030;
+    const COLONS: u64 = 0x0000_FF00_00FF_0000;
+    if t & COLONS != 0x0000_0A00_000A_0000 {
+        return None;
+    }
+    let d = t & !COLONS;
+    if (d | d.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let h = (d & 0xFF) * 10 + ((d >> 8) & 0xFF);
+    let mi = ((d >> 24) & 0xFF) * 10 + ((d >> 32) & 0xFF);
+    let s = ((d >> 48) & 0xFF) * 10 + ((d >> 56) & 0xFF);
+    let (h, mi, s) = (h as i64, mi as i64, s as i64);
     if h > 23 || mi > 59 || s > 59 {
         return None;
     }

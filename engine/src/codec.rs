@@ -1,7 +1,7 @@
 //! Injective ID codec into u64.
 //!
 //! Class A (bit 63 clear): length 1..=9, first byte anything, the rest from the
-//! alphabet [0-9_a-z]. code = first_byte << 42 | base-38 digits (end = 0), so numeric
+//! alphabet [0-9_a-z]. code = first_byte << 48 | 6-bit symbols (end = 0), so numeric
 //! order of class-A codes equals byte-wise order of the strings.
 //! Class B (bit 63 set): index into a global exact string table.
 
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub const CLASS_B: u64 = 1 << 63;
-const LOW42: u64 = (1u64 << 42) - 1;
+const LOW48: u64 = (1u64 << 48) - 1;
 
 static DIGIT: [u8; 256] = {
     let mut t = [0xFFu8; 256];
@@ -40,13 +40,13 @@ pub fn encode_a(s: &[u8]) -> Option<u64> {
     let mut bad = 0u8;
     for i in 1..9 {
         let d = if i < n { DIGIT[s[i] as usize] } else { 0 };
-        bad |= d & 0x80;
-        v = v * 38 + (d as u64 & 0x3F);
+        bad |= d;
+        v = (v << 6) | (d & 0x3F) as u64;
     }
-    if bad != 0 {
+    if bad & 0x80 != 0 {
         return None;
     }
-    Some(((s[0] as u64) << 42) | v)
+    Some(((s[0] as u64) << 48) | v)
 }
 
 pub struct StrTable {
@@ -98,12 +98,11 @@ pub fn decode_into(c: u64, out: &mut Vec<u8>) {
         out.extend_from_slice(&g.as_ref().unwrap().strs[(c & !CLASS_B) as usize]);
         return;
     }
-    out.push((c >> 42) as u8);
-    let mut v = c & LOW42;
+    out.push((c >> 48) as u8);
+    let v = c & LOW48;
     let mut digs = [0u8; 8];
-    for i in (0..8).rev() {
-        digs[i] = (v % 38) as u8;
-        v /= 38;
+    for i in 0..8 {
+        digs[i] = ((v >> (6 * (7 - i))) & 0x3F) as u8;
     }
     for d in digs {
         if d == 0 {

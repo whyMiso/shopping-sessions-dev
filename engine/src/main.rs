@@ -260,7 +260,6 @@ fn push_blk<T>(list: &mut Vec<Vec<T>>, v: T) {
 struct Ctx {
     ws: i64,
     we: i64,
-    link: Map64,
     prod_a: Map64,
     prod_b: HashMap<Vec<u8>, u32>,
     unknown_cat: u32,
@@ -273,11 +272,6 @@ struct Ctx {
 }
 
 impl Ctx {
-    #[inline]
-    fn person(&self, user: &[u8]) -> u64 {
-        let c = encode(user);
-        self.link.get(c).unwrap_or(c)
-    }
     #[inline]
     fn cat(&self, prod: &[u8]) -> u32 {
         if let Some(c) = codec::encode_a(prod) {
@@ -365,9 +359,7 @@ fn parse_event(ctx: &Ctx, dc: &mut DateCache, line: &[u8]) -> Option<EvRec> {
         _ => return Some(r),
     }
     r.ts = (ts - ctx.base) as u32;
-    let uc = encode(user);
-    ctx.link.prefetch(uc);
-    r.person = uc;
+    r.person = encode(user);
     Some(r)
 }
 
@@ -390,9 +382,54 @@ fn parse_click(ctx: &Ctx, dc: &mut DateCache, line: &[u8]) -> Option<CRec> {
         _ => return None,
     };
     let camp = ctx.camp(g(2))?;
-    let uc = encode(user);
-    ctx.link.prefetch(uc);
-    Some(CRec { person: uc, tc: (((ts - ctx.base) as u64) << 32) | camp as u64, code: encode(cid) })
+    Some(CRec { person: encode(user), tc: (((ts - ctx.base) as u64) << 32) | camp as u64, code: encode(cid) })
+}
+
+fn build_links(edges: Vec<Vec<(u64, u64)>>) -> Map64 {
+    let nedges: usize = edges.iter().map(|v| v.len()).sum();
+    let mut idx = Map64::with_capacity(nedges * 2);
+    let mut codes: Vec<u64> = Vec::new();
+    let mut parent: Vec<u32> = Vec::new();
+    for v in &edges {
+        for &(a, b) in v {
+            let ia = idx.insert(a, codes.len() as u64) as u32;
+            if ia as usize == codes.len() {
+                codes.push(a);
+                parent.push(ia);
+            }
+            let ib = idx.insert(b, codes.len() as u64) as u32;
+            if ib as usize == codes.len() {
+                codes.push(b);
+                parent.push(ib);
+            }
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            if ra != rb {
+                if ra < rb {
+                    parent[rb as usize] = ra;
+                } else {
+                    parent[ra as usize] = rb;
+                }
+            }
+        }
+    }
+    drop(edges);
+    let n = codes.len();
+    let mut name: Vec<u64> = vec![u64::MAX; n];
+    let mut has: Vec<bool> = vec![false; n];
+    for i in 0..n {
+        let r = find(&mut parent, i as u32) as usize;
+        if !has[r] || cmp_codes(codes[i], name[r]) == std::cmp::Ordering::Less {
+            name[r] = codes[i];
+            has[r] = true;
+        }
+    }
+    let mut link = Map64::with_capacity(n);
+    for i in 0..n {
+        let r = find(&mut parent, i as u32) as usize;
+        link.insert(codes[i], name[r]);
+    }
+    link
 }
 
 // ---------------------------------------------------------------- union find
@@ -525,7 +562,7 @@ fn main() {
     let (link_chunks, rest): (Vec<_>, Vec<_>) = chunks.into_iter().partition(|c| c.kind == 0);
     let mut main_chunks = rest;
     // largest-first order is not needed for equal-size chunks; keep events then clicks interleaved
-    main_chunks.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
+    main_chunks.sort_by_key(|c| (c.kind == 2, std::cmp::Reverse(c.end - c.start)));
 
     // ---------------- links
     let edges: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
@@ -557,51 +594,8 @@ fn main() {
         });
     }
     let edges = edges.into_inner().unwrap();
-    let nedges: usize = edges.iter().map(|v| v.len()).sum();
-    let mut idx = Map64::with_capacity(nedges * 2);
-    let mut codes: Vec<u64> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    for v in &edges {
-        for &(a, b) in v {
-            let ia = idx.insert(a, codes.len() as u64) as u32;
-            if ia as usize == codes.len() {
-                codes.push(a);
-                parent.push(ia);
-            }
-            let ib = idx.insert(b, codes.len() as u64) as u32;
-            if ib as usize == codes.len() {
-                codes.push(b);
-                parent.push(ib);
-            }
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                if ra < rb {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
-                }
-            }
-        }
-    }
-    drop(edges);
-    let n = codes.len();
-    let mut name: Vec<u64> = vec![u64::MAX; n];
-    let mut has: Vec<bool> = vec![false; n];
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        if !has[r] || cmp_codes(codes[i], name[r]) == std::cmp::Ordering::Less {
-            name[r] = codes[i];
-            has[r] = true;
-        }
-    }
-    let mut link = Map64::with_capacity(n);
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        link.insert(codes[i], name[r]);
-    }
-    drop(idx);
-    lap("links");
+    lap("link edges");
+
 
     // ---------------- parse events & clicks
     let est_rows = (ev_bytes / 70).max(1024);
@@ -613,7 +607,7 @@ fn main() {
         std::process::exit(3);
     }
     let ing0 = ws.div_euclid(1000) - (1i64 << 31);
-    let ctx = Ctx { ws, we, link, prod_a, prod_b, unknown_cat, camp_a, camp_b, p1_bits, q_bits, base, ing0 };
+    let ctx = Ctx { ws, we, prod_a, prod_b, unknown_cat, camp_a, camp_b, p1_bits, q_bits, base, ing0 };
     let np1 = 1usize << p1_bits;
     let nq = 1usize << q_bits;
     let part_of = |code: u64, bits: u32| -> usize {
@@ -631,13 +625,20 @@ fn main() {
     let tas: Vec<Mutex<TA>> = (0..nthreads)
         .map(|_| Mutex::new(TA { ev: (0..np1).map(|_| Vec::new()).collect(), ck: (0..nq).map(|_| Vec::new()).collect() }))
         .collect();
+    let link_cell: std::sync::OnceLock<Map64> = std::sync::OnceLock::new();
+    let edges_cell = Mutex::new(Some(edges));
     {
         let next = AtomicUsize::new(0);
         run_parallel(nthreads, |t| {
+            if t == 0 {
+                let e = edges_cell.lock().unwrap().take().unwrap();
+                let _ = link_cell.set(build_links(e));
+            }
             let mut ta = tas[t].lock().unwrap();
             let ta = &mut *ta;
             let mut buf = Vec::new();
             let mut dc = DateCache::new();
+            let mut link_ref: Option<&Map64> = None;
             loop {
                 let i = next.fetch_add(1, AO::Relaxed);
                 if i >= main_chunks.len() {
@@ -645,36 +646,32 @@ fn main() {
                 }
                 let c = &main_chunks[i];
                 if c.kind == 1 {
-                    let mut ring: Vec<EvRec> = Vec::with_capacity(32);
-                    let mut flush = |ring: &mut Vec<EvRec>, ta: &mut TA| {
-                        for r in ring.iter_mut() {
-                            if r.person != DEAD {
-                                r.person = ctx.link.get(r.person).unwrap_or(r.person);
-                            }
-                            push_blk(&mut ta.ev[part_of(r.code, ctx.p1_bits)], *r);
-                        }
-                        ring.clear();
-                    };
                     for_lines(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |line| {
                         if let Some(r) = parse_event(&ctx, &mut dc, line) {
-                            ring.push(r);
-                            if ring.len() == 32 {
-                                flush(&mut ring, ta);
-                            }
+                            push_blk(&mut ta.ev[part_of(r.code, ctx.p1_bits)], r);
                         }
                     });
-                    flush(&mut ring, ta);
                 } else {
+                    let link = loop {
+                        if let Some(m) = link_ref {
+                            break m;
+                        }
+                        match link_cell.get() {
+                            Some(m) => link_ref = Some(m),
+                            None => std::thread::yield_now(),
+                        }
+                    };
                     let mut ring: Vec<CRec> = Vec::with_capacity(32);
-                    let mut flush = |ring: &mut Vec<CRec>, ta: &mut TA| {
+                    let flush = |ring: &mut Vec<CRec>, ta: &mut TA| {
                         for r in ring.iter_mut() {
-                            r.person = ctx.link.get(r.person).unwrap_or(r.person);
+                            r.person = link.get(r.person).unwrap_or(r.person);
                             push_blk(&mut ta.ck[part_of(r.person, ctx.q_bits)], *r);
                         }
                         ring.clear();
                     };
                     for_lines(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |line| {
                         if let Some(r) = parse_click(&ctx, &mut dc, line) {
+                            link.prefetch(r.person);
                             ring.push(r);
                             if ring.len() == 32 {
                                 flush(&mut ring, ta);
@@ -686,6 +683,7 @@ fn main() {
             }
         });
     }
+    let link = link_cell.get().unwrap();
     lap("parse");
 
     // ---------------- dedup events
@@ -732,11 +730,20 @@ fn main() {
                         }
                     }
                 }
-                for r in &table {
+                const LA: usize = 16;
+                for i in 0..table.len() {
+                    if i + LA < table.len() {
+                        let e = &table[i + LA];
+                        if e.code != DEAD && e.person != DEAD {
+                            link.prefetch(e.person);
+                        }
+                    }
+                    let r = &table[i];
                     if r.code != DEAD && r.person != DEAD {
+                        let person = link.get(r.person).unwrap_or(r.person);
                         push_blk(
-                            &mut out[part_of(r.person, ctx.q_bits)],
-                            SRec { person: r.person, tp: ((r.ts as u64) << 32) | r.pc as u64 },
+                            &mut out[part_of(person, ctx.q_bits)],
+                            SRec { person, tp: ((r.ts as u64) << 32) | r.pc as u64 },
                         );
                     }
                 }
