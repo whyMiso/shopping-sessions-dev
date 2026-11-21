@@ -10,7 +10,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::sync::Mutex;
-use ts::{parse_ts, DAY_MS};
+use ts::{parse_ts, parse_ts_c, DateCache, DAY_MS};
 
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
@@ -21,24 +21,37 @@ const NONE_CAT: u32 = u32::MAX;
 // ---------------------------------------------------------------- hash table u64 -> u64
 const EMPTY: u64 = u64::MAX;
 struct Map64 {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    ents: Vec<[u64; 2]>,
     mask: usize,
 }
 impl Map64 {
     fn with_capacity(n: usize) -> Self {
         let cap = (n.max(8) * 2).next_power_of_two();
-        Map64 { keys: vec![EMPTY; cap], vals: vec![0; cap], mask: cap - 1 }
+        Map64 { ents: vec![[EMPTY, 0]; cap], mask: cap - 1 }
+    }
+    /// Touch the slot so the cache line is on its way before `get`.
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let i = mix(k) as usize & self.mask;
+        let p = unsafe { self.ents.as_ptr().add(i) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe {
+            std::hint::black_box(std::ptr::read_volatile(p as *const u64));
+        }
     }
     #[inline]
     fn get(&self, k: u64) -> Option<u64> {
         let mut i = mix(k) as usize & self.mask;
         loop {
-            let kk = self.keys[i];
-            if kk == k {
-                return Some(self.vals[i]);
+            let e = self.ents[i];
+            if e[0] == k {
+                return Some(e[1]);
             }
-            if kk == EMPTY {
+            if e[0] == EMPTY {
                 return None;
             }
             i = (i + 1) & self.mask;
@@ -48,13 +61,12 @@ impl Map64 {
     fn insert(&mut self, k: u64, v: u64) -> u64 {
         let mut i = mix(k) as usize & self.mask;
         loop {
-            let kk = self.keys[i];
-            if kk == k {
-                return self.vals[i];
+            let e = self.ents[i];
+            if e[0] == k {
+                return e[1];
             }
-            if kk == EMPTY {
-                self.keys[i] = k;
-                self.vals[i] = v;
+            if e[0] == EMPTY {
+                self.ents[i] = [k, v];
                 return v;
             }
             i = (i + 1) & self.mask;
@@ -205,31 +217,44 @@ fn manifest(path: &Path) -> (i64, i64) {
 }
 
 // ---------------------------------------------------------------- records
+const NOCAT: u32 = 0xFF;
+const DEAD: u64 = u64::MAX;
+const BLK: usize = 2048;
+
+/// Event record. `person == DEAD` marks a tombstone (invalid/late kept copy).
 #[derive(Clone, Copy)]
 struct EvRec {
     code: u64,
     person: u64,
-    ts: i64,
-    ingest: i64,
-    cat: u32, // NONE_CAT unless purchase
-    price: u32,
-    valid: bool,
+    ts: u32,     // ms relative to base (ws - 7 days)
+    ingest: u32, // seconds, saturating, relative to ws/1000 - 2^31
+    pc: u32,     // price << 8 | category (category NOCAT for non-purchases)
 }
 
-#[derive(Clone, Copy)]
+/// Sorted by (person, tp): tp = ts << 32 | pc.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SRec {
     person: u64,
-    ts: i64,
-    cat: u32,
-    price: u32,
+    tp: u64,
 }
 
 #[derive(Clone, Copy)]
 struct CRec {
     person: u64,
-    ts: i64,
+    tc: u64, // ts << 32 | camp
     code: u64,
-    camp: u32,
+}
+
+fn push_blk<T>(list: &mut Vec<Vec<T>>, v: T) {
+    if let Some(l) = list.last_mut() {
+        if l.len() < l.capacity() {
+            l.push(v);
+            return;
+        }
+    }
+    let mut n = Vec::with_capacity(BLK);
+    n.push(v);
+    list.push(n);
 }
 
 struct Ctx {
@@ -243,6 +268,8 @@ struct Ctx {
     camp_b: HashMap<Vec<u8>, u32>,
     p1_bits: u32,
     q_bits: u32,
+    base: i64,
+    ing0: i64,
 }
 
 impl Ctx {
@@ -293,7 +320,7 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_event(ctx: &Ctx, line: &[u8]) -> Option<EvRec> {
+fn parse_event(ctx: &Ctx, dc: &mut DateCache, line: &[u8]) -> Option<EvRec> {
     let mut f = [(0u32, 0u32); 7];
     if !csv::split::<7>(line, &mut f) {
         return None;
@@ -304,18 +331,21 @@ fn parse_event(ctx: &Ctx, line: &[u8]) -> Option<EvRec> {
         return None;
     }
     let code = encode(eid);
-    let ingest = parse_ts(g(3)).unwrap_or(i64::MAX);
-    let mut r = EvRec { code, person: 0, ts: 0, ingest, cat: NONE_CAT, price: 0, valid: false };
+    let ing = parse_ts_c(g(3), dc);
+    let ingest = match ing {
+        Some(v) => (v.div_euclid(1000) - ctx.ing0).clamp(0, u32::MAX as i64) as u32,
+        None => u32::MAX,
+    };
+    let mut r = EvRec { code, person: DEAD, ts: 0, ingest, pc: NOCAT };
     let user = g(1);
     if user.is_empty() {
         return Some(r);
     }
-    let ts = match parse_ts(g(2)) {
+    let ts = match parse_ts_c(g(2), dc) {
         Some(t) if t >= ctx.ws && t < ctx.we => t,
         _ => return Some(r),
     };
-    let ty = g(4);
-    let purchase = match ty {
+    let purchase = match g(4) {
         b"view" | b"cart" => false,
         b"purchase" => true,
         _ => return Some(r),
@@ -326,23 +356,22 @@ fn parse_event(ctx: &Ctx, line: &[u8]) -> Option<EvRec> {
     }
     if purchase {
         match parse_price(g(6)) {
-            Some(p) => {
-                r.price = p;
-                r.cat = ctx.cat(prod);
-            }
+            Some(p) => r.pc = (p << 8) | ctx.cat(prod),
             None => return Some(r),
         }
     }
-    if ingest == i64::MAX || ingest - ts > LATE_MS {
-        return Some(r);
+    match ing {
+        Some(v) if v - ts <= LATE_MS => {}
+        _ => return Some(r),
     }
-    r.ts = ts;
-    r.person = ctx.person(user);
-    r.valid = true;
+    r.ts = (ts - ctx.base) as u32;
+    let uc = encode(user);
+    ctx.link.prefetch(uc);
+    r.person = uc;
     Some(r)
 }
 
-fn parse_click(ctx: &Ctx, line: &[u8]) -> Option<CRec> {
+fn parse_click(ctx: &Ctx, dc: &mut DateCache, line: &[u8]) -> Option<CRec> {
     let mut f = [(0u32, 0u32); 4];
     if !csv::split::<4>(line, &mut f) {
         return None;
@@ -356,12 +385,14 @@ fn parse_click(ctx: &Ctx, line: &[u8]) -> Option<CRec> {
     if user.is_empty() {
         return None;
     }
-    let ts = match parse_ts(g(3)) {
+    let ts = match parse_ts_c(g(3), dc) {
         Some(t) if t >= ctx.ws - WEEK_MS && t < ctx.we => t,
         _ => return None,
     };
     let camp = ctx.camp(g(2))?;
-    Some(CRec { person: ctx.person(user), ts, code: encode(cid), camp })
+    let uc = encode(user);
+    ctx.link.prefetch(uc);
+    Some(CRec { person: uc, tc: (((ts - ctx.base) as u64) << 32) | camp as u64, code: encode(cid) })
 }
 
 // ---------------------------------------------------------------- union find
@@ -470,6 +501,7 @@ fn main() {
     channels.push(b"organic".to_vec());
     lap("small tables");
 
+    let ncats = cats.len();
     // file lists and chunks
     let mut files: Vec<(PathBuf, u64)> = Vec::new();
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -575,7 +607,13 @@ fn main() {
     let est_rows = (ev_bytes / 70).max(1024);
     let p1_bits = ((est_rows / 40_000).max(1).next_power_of_two().trailing_zeros()).min(12);
     let q_bits = ((est_rows / 60_000).max(1).next_power_of_two().trailing_zeros()).clamp(4, 12);
-    let ctx = Ctx { ws, we, link, prod_a, prod_b, unknown_cat, camp_a, camp_b, p1_bits, q_bits };
+    let base = ws - WEEK_MS;
+    if we - base >= (1i64 << 32) || ncats >= 255 {
+        eprintln!("unsupported window/category count");
+        std::process::exit(3);
+    }
+    let ing0 = ws.div_euclid(1000) - (1i64 << 31);
+    let ctx = Ctx { ws, we, link, prod_a, prod_b, unknown_cat, camp_a, camp_b, p1_bits, q_bits, base, ing0 };
     let np1 = 1usize << p1_bits;
     let nq = 1usize << q_bits;
     let part_of = |code: u64, bits: u32| -> usize {
@@ -587,8 +625,8 @@ fn main() {
     };
 
     struct TA {
-        ev: Vec<Vec<EvRec>>,
-        ck: Vec<Vec<CRec>>,
+        ev: Vec<Vec<Vec<EvRec>>>,
+        ck: Vec<Vec<Vec<CRec>>>,
     }
     let tas: Vec<Mutex<TA>> = (0..nthreads)
         .map(|_| Mutex::new(TA { ev: (0..np1).map(|_| Vec::new()).collect(), ck: (0..nq).map(|_| Vec::new()).collect() }))
@@ -599,6 +637,7 @@ fn main() {
             let mut ta = tas[t].lock().unwrap();
             let ta = &mut *ta;
             let mut buf = Vec::new();
+            let mut dc = DateCache::new();
             loop {
                 let i = next.fetch_add(1, AO::Relaxed);
                 if i >= main_chunks.len() {
@@ -606,17 +645,43 @@ fn main() {
                 }
                 let c = &main_chunks[i];
                 if c.kind == 1 {
+                    let mut ring: Vec<EvRec> = Vec::with_capacity(32);
+                    let mut flush = |ring: &mut Vec<EvRec>, ta: &mut TA| {
+                        for r in ring.iter_mut() {
+                            if r.person != DEAD {
+                                r.person = ctx.link.get(r.person).unwrap_or(r.person);
+                            }
+                            push_blk(&mut ta.ev[part_of(r.code, ctx.p1_bits)], *r);
+                        }
+                        ring.clear();
+                    };
                     for_lines(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |line| {
-                        if let Some(r) = parse_event(&ctx, line) {
-                            ta.ev[part_of(r.code, ctx.p1_bits)].push(r);
+                        if let Some(r) = parse_event(&ctx, &mut dc, line) {
+                            ring.push(r);
+                            if ring.len() == 32 {
+                                flush(&mut ring, ta);
+                            }
                         }
                     });
+                    flush(&mut ring, ta);
                 } else {
+                    let mut ring: Vec<CRec> = Vec::with_capacity(32);
+                    let mut flush = |ring: &mut Vec<CRec>, ta: &mut TA| {
+                        for r in ring.iter_mut() {
+                            r.person = ctx.link.get(r.person).unwrap_or(r.person);
+                            push_blk(&mut ta.ck[part_of(r.person, ctx.q_bits)], *r);
+                        }
+                        ring.clear();
+                    };
                     for_lines(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |line| {
-                        if let Some(r) = parse_click(&ctx, line) {
-                            ta.ck[part_of(r.person, ctx.q_bits)].push(r);
+                        if let Some(r) = parse_click(&ctx, &mut dc, line) {
+                            ring.push(r);
+                            if ring.len() == 32 {
+                                flush(&mut ring, ta);
+                            }
                         }
                     });
+                    flush(&mut ring, ta);
                 }
             }
         });
@@ -625,37 +690,55 @@ fn main() {
 
     // ---------------- dedup events
     let mut tas: Vec<TA> = tas.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let ev_parts: Vec<Vec<Vec<EvRec>>> = tas.iter_mut().map(|t| std::mem::take(&mut t.ev)).collect();
-    let ck_parts: Vec<Vec<Vec<CRec>>> = tas.iter_mut().map(|t| std::mem::take(&mut t.ck)).collect();
+    let ev_parts: Vec<Vec<Vec<Vec<EvRec>>>> = tas.iter_mut().map(|t| std::mem::take(&mut t.ev)).collect();
+    let ck_parts: Vec<Vec<Vec<Vec<CRec>>>> = tas.iter_mut().map(|t| std::mem::take(&mut t.ck)).collect();
     drop(tas);
-    let sparts: Vec<Mutex<Vec<Vec<SRec>>>> =
+    let sparts: Vec<Mutex<Vec<Vec<Vec<SRec>>>>> =
         (0..nthreads).map(|_| Mutex::new((0..nq).map(|_| Vec::new()).collect())).collect();
     {
         let next = AtomicUsize::new(0);
         run_parallel(nthreads, |t| {
             let mut out = sparts[t].lock().unwrap();
-            let mut scratch: Vec<EvRec> = Vec::new();
+            let mut table: Vec<EvRec> = Vec::new();
+            let empty = EvRec { code: DEAD, person: DEAD, ts: 0, ingest: 0, pc: 0 };
             loop {
                 let p = next.fetch_add(1, AO::Relaxed);
                 if p >= np1 {
                     break;
                 }
-                scratch.clear();
+                let n: usize = ev_parts.iter().map(|tp| tp[p].iter().map(|b| b.len()).sum::<usize>()).sum();
+                let cap = (n.max(4) * 2).next_power_of_two();
+                table.clear();
+                table.resize(cap, empty);
+                let mask = cap - 1;
                 for tp in &ev_parts {
-                    scratch.extend_from_slice(&tp[p]);
+                    for blk in &tp[p] {
+                        for r in blk {
+                            let mut i = mix(r.code) as usize & mask;
+                            loop {
+                                let e = &mut table[i];
+                                if e.code == r.code {
+                                    if r.ingest < e.ingest {
+                                        *e = *r;
+                                    }
+                                    break;
+                                }
+                                if e.code == DEAD {
+                                    *e = *r;
+                                    break;
+                                }
+                                i = (i + 1) & mask;
+                            }
+                        }
+                    }
                 }
-                scratch.sort_unstable_by_key(|r| (r.code, r.ingest));
-                let mut i = 0;
-                while i < scratch.len() {
-                    let r = scratch[i];
-                    let mut j = i + 1;
-                    while j < scratch.len() && scratch[j].code == r.code {
-                        j += 1;
+                for r in &table {
+                    if r.code != DEAD && r.person != DEAD {
+                        push_blk(
+                            &mut out[part_of(r.person, ctx.q_bits)],
+                            SRec { person: r.person, tp: ((r.ts as u64) << 32) | r.pc as u64 },
+                        );
                     }
-                    if r.valid {
-                        out[part_of(r.person, ctx.q_bits)].push(SRec { person: r.person, ts: r.ts, cat: r.cat, price: r.price });
-                    }
-                    i = j;
                 }
             }
         });
@@ -664,11 +747,10 @@ fn main() {
     lap("dedup");
 
     // ---------------- sessionize per person partition
-    let sparts: Vec<Vec<Vec<SRec>>> = sparts.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let sparts: Vec<Vec<Vec<Vec<SRec>>>> = sparts.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let day0 = ws.div_euclid(DAY_MS);
     let day1 = (we - 1).div_euclid(DAY_MS);
     let ndays = (day1 - day0 + 1).max(1) as usize;
-    let ncats = cats.len();
     let ncol = ncamp + 1;
     struct TC {
         uo: UserOut,
@@ -696,16 +778,23 @@ fn main() {
                 ev.clear();
                 ck.clear();
                 for tp in &sparts {
-                    ev.extend_from_slice(&tp[q]);
+                    for blk in &tp[q] {
+                        ev.extend_from_slice(blk);
+                    }
                 }
                 for tp in &ck_parts {
-                    ck.extend_from_slice(&tp[q]);
+                    for blk in &tp[q] {
+                        ck.extend_from_slice(blk);
+                    }
                 }
-                ev.sort_unstable_by_key(|r| (r.person, r.ts));
+                ev.sort_unstable();
                 ck.sort_unstable_by(|a, b| {
-                    a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| cmp_codes(a.code, b.code))
+                    a.person
+                        .cmp(&b.person)
+                        .then((a.tc >> 32).cmp(&(b.tc >> 32)))
+                        .then_with(|| cmp_codes(a.code, b.code))
                 });
-                ck.dedup_by(|b, a| a.code == b.code && a.person == b.person && a.ts == b.ts);
+                ck.dedup_by(|b, a| a.code == b.code && a.person == b.person && (a.tc >> 32) == (b.tc >> 32));
                 // walk persons
                 let mut ci = 0usize; // click cursor
                 let mut i = 0usize;
@@ -752,9 +841,9 @@ fn main() {
                     };
                     let mut s = i;
                     while s < pe {
-                        let start = ev[s].ts;
+                        let start = (ev[s].tp >> 32) as i64 + base;
                         let mut e = s + 1;
-                        while e < pe && ev[e].ts - ev[e - 1].ts <= GAP_MS {
+                        while e < pe && (ev[e].tp >> 32) as i64 - (ev[e - 1].tp >> 32) as i64 <= GAP_MS {
                             e += 1;
                         }
                         let day = start.div_euclid(DAY_MS);
@@ -770,18 +859,21 @@ fn main() {
                         let mut rev = 0i64;
                         let mut purch = false;
                         for r in &ev[s..e] {
-                            if r.cat != NONE_CAT {
+                            let pc = r.tp as u32;
+                            let cat = pc & 0xFF;
+                            if cat != NOCAT {
+                                let price = (pc >> 8) as i64;
                                 purch = true;
-                                rev += r.price as i64;
-                                if catsum[r.cat as usize] == 0 {
-                                    touched.push(r.cat);
+                                rev += price;
+                                if catsum[cat as usize] == 0 {
+                                    touched.push(cat);
                                 }
-                                catsum[r.cat as usize] += r.price as i64;
+                                catsum[cat as usize] += price;
                             }
                         }
                         // attribution: window [start - 7d, start]
-                        while hi < clicks.len() && clicks[hi].ts <= start {
-                            let c = clicks[hi].camp as usize;
+                        while hi < clicks.len() && (clicks[hi].tc >> 32) as i64 + base <= start {
+                            let c = clicks[hi].tc as u32 as usize;
                             if cnt[c] == 0 {
                                 apos[c] = active.len() as u32;
                                 active.push(c as u32);
@@ -789,8 +881,8 @@ fn main() {
                             cnt[c] += 1;
                             hi += 1;
                         }
-                        while lo < hi && clicks[lo].ts < start - WEEK_MS {
-                            let c = clicks[lo].camp as usize;
+                        while lo < hi && ((clicks[lo].tc >> 32) as i64 + base) < start - WEEK_MS {
+                            let c = clicks[lo].tc as u32 as usize;
                             cnt[c] -= 1;
                             if cnt[c] == 0 {
                                 let p = apos[c] as usize;
@@ -802,12 +894,12 @@ fn main() {
                             lo += 1;
                         }
                         let credited = if hi > lo {
-                            let lt = clicks[hi - 1].ts;
+                            let lt = clicks[hi - 1].tc >> 32;
                             let mut k = hi - 1;
-                            while k > lo && clicks[k - 1].ts == lt {
+                            while k > lo && (clicks[k - 1].tc >> 32) == lt {
                                 k -= 1;
                             }
-                            clicks[k].camp as usize
+                            clicks[k].tc as u32 as usize
                         } else {
                             ncamp
                         };

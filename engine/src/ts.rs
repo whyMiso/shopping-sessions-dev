@@ -116,6 +116,87 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     None
 }
 
+/// Direct-mapped cache of validated `YYYY-MM-DD` prefixes -> days since epoch.
+pub struct DateCache {
+    k1: [u64; 64],
+    k2: [u16; 64],
+    v: [i64; 64],
+    used: [bool; 64],
+}
+
+impl DateCache {
+    pub fn new() -> Self {
+        DateCache { k1: [0; 64], k2: [0; 64], v: [0; 64], used: [false; 64] }
+    }
+}
+
+#[inline]
+fn date_days(b: &[u8]) -> Option<i64> {
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y = d2(b, 0)? * 100 + d2(b, 2)?;
+    let mo = d2(b, 5)?;
+    let d = d2(b, 8)?;
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
+/// Same result as `parse_ts`, with a date-prefix cache for F1/F2.
+#[inline]
+pub fn parse_ts_c(b: &[u8], c: &mut DateCache) -> Option<i64> {
+    let n = b.len();
+    if n != 20 && n != 25 {
+        return parse_ts(b);
+    }
+    let k1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let k2 = u16::from_le_bytes([b[8], b[9]]);
+    let h = ((k1 ^ ((k2 as u64) << 17)).wrapping_mul(0x9E3779B97F4A7C15) >> 58) as usize;
+    let days = if c.used[h] && c.k1[h] == k1 && c.k2[h] == k2 {
+        c.v[h]
+    } else {
+        match date_days(b) {
+            Some(d) => {
+                c.used[h] = true;
+                c.k1[h] = k1;
+                c.k2[h] = k2;
+                c.v[h] = d;
+                d
+            }
+            None => return None,
+        }
+    };
+    if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let h = d2(b, 11)?;
+    let mi = d2(b, 14)?;
+    let s = d2(b, 17)?;
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let local = ((days * 24 + h) * 60 + mi) * 60_000 + s * 1000;
+    if n == 20 {
+        return if b[19] == b'Z' { Some(local) } else { None };
+    }
+    let sign = match b[19] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    if b[22] != b':' {
+        return None;
+    }
+    let oh = d2(b, 20)?;
+    let om = d2(b, 23)?;
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some(local - sign * (oh * 3_600_000 + om * 60_000))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +215,27 @@ mod tests {
         assert!(parse_ts(b"2026-10-03T10:00:00-00:00").is_some());
         assert_eq!(parse_ts(b"99999999999999999999"), None);
         assert_eq!(parse_ts(b"-5"), None);
+    }
+    #[test]
+    fn cached_equals_slow() {
+        let mut c = DateCache::new();
+        let mut xs: Vec<Vec<u8>> = Vec::new();
+        for y in [2025, 2026, 2028, 2100, 1999] {
+            for mo in 0..=13 {
+                for d in [0, 1, 15, 28, 29, 30, 31, 32] {
+                    for t in [&b"T00:00:00Z"[..], b"T23:59:59Z", b"T24:00:00Z", b"T10:60:00Z", b"T10:00:60Z", b"t10:00:00Z", b"T10:00:00z", b"T10:00:00+05:30", b"T10:00:00-23:59", b"T10:00:00+24:00", b"T10:00:00+05:60", b"T10:00:00+0530", b"T10:00:00-00:00"] {
+                        xs.push(format!("{y:04}-{mo:02}-{d:02}").into_bytes().into_iter().chain(t.iter().copied()).collect());
+                    }
+                }
+            }
+        }
+        xs.push(b"2026-10-03 10:00:00Z".to_vec());
+        xs.push(b"2026-10-03T10:00:00.5Z".to_vec());
+        xs.push(b"20x6-10-03T10:00:00Z".to_vec());
+        for x in &xs {
+            for _ in 0..2 {
+                assert_eq!(parse_ts_c(x, &mut c), parse_ts(x), "{}", String::from_utf8_lossy(x));
+            }
+        }
     }
 }
