@@ -67,3 +67,16 @@ jobs:
           rm -rf /tmp/big_out; time CPUS=$(nproc) MEM=12g scripts/docker_run.sh /tmp/big /tmp/big_out_docker
           oracle/target/release/oracle /tmp/big /tmp/big_ref
           cd scripts && python3 compare.py /tmp/big_out_docker /tmp/big_ref
+      - name: Scaling and perf profile
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.big != '0' }}
+        run: |
+          for n in 1 2 4; do echo "NCPU=$n"; rm -rf /tmp/big_out; NCPU=$n ENGINE_TIMING=1 engine/target/release/engine /tmp/big /tmp/big_out 2>&1 | tr '\n' ' '; echo; done
+          lscpu | grep -E 'Thread|Core|Socket|L2|L3|MHz' | tr -s ' ' | tr '\n' ';'; echo
+          cat /sys/kernel/mm/transparent_hugepage/enabled || true
+          sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -q linux-tools-generic >/dev/null 2>&1 || true
+          cd engine && CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release --target-dir /tmp/tgt_dbg 2>&1 | tail -1; cd ..
+          rm -rf /tmp/big_out
+          P=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); echo "perf=$P"
+          sudo sysctl kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
+          sudo $P record -e cpu-clock -F 2000 -o /tmp/perf.data /tmp/tgt_dbg/release/engine /tmp/big /tmp/big_out 2>&1 | tail -2 || true
+          sudo $P report -i /tmp/perf.data --stdio --no-children 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30 | cut -c1-150 || true
