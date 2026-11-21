@@ -10,6 +10,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64-v3
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

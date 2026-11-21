@@ -103,65 +103,50 @@ fn list_csv(dir: &Path) -> Vec<(PathBuf, u64)> {
     v
 }
 
-/// Calls `f(line)` for every line that starts in [start, end) of the file, excluding the header.
-fn for_lines(file: &File, size: u64, start: u64, end: u64, buf: &mut Vec<u8>, mut f: impl FnMut(&[u8])) {
+/// Calls `f(buf, line_start, line_end, commas, n_commas, n_quotes)` for every line that starts
+/// in [start, end) of the file, excluding the header (the first line of the file).
+fn for_chunk(
+    file: &File,
+    size: u64,
+    start: u64,
+    end: u64,
+    buf: &mut Vec<u8>,
+    mut f: impl FnMut(&[u8], usize, usize, &[u32; 16], usize, u32),
+) {
     let from = if start == 0 { 0 } else { start - 1 };
     let mut want = (end - from + 65536).min(size - from) as usize;
     loop {
-        buf.resize(want, 0);
+        buf.resize(want + 64, 0);
         file.read_exact_at(&mut buf[..want], from).expect("read");
-        // position of first line start >= start
-        let mut pos: usize;
-        if start == 0 {
-            // skip header line
-            match memchr(b'\n', &buf[..want]) {
-                Some(p) => pos = p + 1,
-                None => return,
-            }
-        } else {
-            match memchr(b'\n', &buf[..want]) {
-                Some(p) => pos = p + 1,
-                None => {
-                    if from + want as u64 >= size {
-                        return;
-                    }
-                    want = (want * 2).min((size - from) as usize);
-                    continue;
-                }
-            }
-        }
-        let lim = (end - from) as usize;
+        buf[want..want + 64].fill(0);
         let at_eof = from + want as u64 >= size;
-        // Check that the last line starting before lim is complete in buf.
-        let mut ok = true;
-        {
-            let mut p = pos;
-            while p < lim {
-                match memchr(b'\n', &buf[p..want]) {
-                    Some(q) => p += q + 1,
-                    None => {
-                        if !at_eof {
-                            ok = false;
-                        }
-                        break;
-                    }
+        let pos = match memchr(b'\n', &buf[..want]) {
+            Some(p) => p + 1,
+            None => {
+                if at_eof {
+                    return;
                 }
+                want = (want * 2).min((size - from) as usize);
+                continue;
             }
+        };
+        let lim = (end - from) as usize;
+        if pos >= lim {
+            return;
         }
-        if !ok {
+        if !at_eof && memchr(b'\n', &buf[lim - 1..want]).is_none() {
             want = (want * 2).min((size - from) as usize);
             continue;
         }
-        while pos < lim && pos < want {
-            let e = match memchr(b'\n', &buf[pos..want]) {
-                Some(q) => pos + q,
-                None => want,
-            };
-            f(&buf[pos..e]);
-            pos = e + 1;
-        }
+        let b: &[u8] = &buf[..];
+        csv::scan_lines(b, pos, lim, want, |ls, le, commas, nc, q| f(b, ls, le, commas, nc, q));
         return;
     }
+}
+
+/// Line-at-a-time wrapper (used for small inputs such as links).
+fn for_lines(file: &File, size: u64, start: u64, end: u64, buf: &mut Vec<u8>, mut f: impl FnMut(&[u8])) {
+    for_chunk(file, size, start, end, buf, |b, ls, le, _, _, _| f(&b[ls..le]));
 }
 
 #[inline]
@@ -314,11 +299,13 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     }
 }
 
-fn parse_event(ctx: &Ctx, dc: &mut DateCache, line: &[u8]) -> Option<EvRec> {
+#[inline(always)]
+fn parse_event(ctx: &Ctx, dc: &mut DateCache, buf: &[u8], ls: usize, le: usize, commas: &[u32; 16], nc: usize, quotes: u32) -> Option<EvRec> {
     let mut f = [(0u32, 0u32); 7];
-    if !csv::split::<7>(line, &mut f) {
+    if !csv::fields::<7>(buf, ls, le, commas, nc, quotes, &mut f) {
         return None;
     }
+    let line = &buf[ls..le];
     let g = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
     let eid = g(0);
     if eid.is_empty() {
@@ -363,11 +350,13 @@ fn parse_event(ctx: &Ctx, dc: &mut DateCache, line: &[u8]) -> Option<EvRec> {
     Some(r)
 }
 
-fn parse_click(ctx: &Ctx, dc: &mut DateCache, line: &[u8]) -> Option<CRec> {
+#[inline(always)]
+fn parse_click(ctx: &Ctx, dc: &mut DateCache, buf: &[u8], ls: usize, le: usize, commas: &[u32; 16], nc: usize, quotes: u32) -> Option<CRec> {
     let mut f = [(0u32, 0u32); 4];
-    if !csv::split::<4>(line, &mut f) {
+    if !csv::fields::<4>(buf, ls, le, commas, nc, quotes, &mut f) {
         return None;
     }
+    let line = &buf[ls..le];
     let g = |i: usize| &line[f[i].0 as usize..f[i].1 as usize];
     let cid = g(0);
     if cid.is_empty() {
@@ -646,8 +635,8 @@ fn main() {
                 }
                 let c = &main_chunks[i];
                 if c.kind == 1 {
-                    for_lines(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |line| {
-                        if let Some(r) = parse_event(&ctx, &mut dc, line) {
+                    for_chunk(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |b, ls, le, cm, nc, q| {
+                        if let Some(r) = parse_event(&ctx, &mut dc, b, ls, le, cm, nc, q) {
                             push_blk(&mut ta.ev[part_of(r.code, ctx.p1_bits)], r);
                         }
                     });
@@ -669,8 +658,8 @@ fn main() {
                         }
                         ring.clear();
                     };
-                    for_lines(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |line| {
-                        if let Some(r) = parse_click(&ctx, &mut dc, line) {
+                    for_chunk(&handles[c.file], files[c.file].1, c.start, c.end, &mut buf, |b, ls, le, cm, nc, q| {
+                        if let Some(r) = parse_click(&ctx, &mut dc, b, ls, le, cm, nc, q) {
                             link.prefetch(r.person);
                             ring.push(r);
                             if ring.len() == 32 {
