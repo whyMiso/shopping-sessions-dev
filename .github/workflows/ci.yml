@@ -17,7 +17,7 @@ jobs:
           python-version: '3.12'
       - name: CPU
         run: |
-          nproc; free -g; grep -m1 'model name' /proc/cpuinfo
+          nproc; free -g; lscpu | grep -E 'Model name|Flags' | cut -c1-600; grep -m1 'model name' /proc/cpuinfo
           grep -m1 -o 'avx512[a-z]*' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
       - name: Build
         run: |
@@ -54,8 +54,8 @@ jobs:
       - name: Docker image fixtures
         run: |
           docker build -q -t shopping-sessions:latest .
-          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh | tail -1
-          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh > /dev/null
+          export CPUS=$(nproc) MEM=12g
+          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh 2>&1 | tail -15
       - name: Timing run vs oracle
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.big != '0' }}
         run: |
@@ -64,6 +64,6 @@ jobs:
           $G --seed 77 --events $E --clicks $((E/4)) --output /tmp/big
           du -sh /tmp/big
           for i in 1 2 3; do rm -rf /tmp/big_out; /usr/bin/time -v env ENGINE_TIMING=1 engine/target/release/engine /tmp/big /tmp/big_out 2>&1 | grep -E 's |Elapsed|Maximum resident'; done
-          rm -rf /tmp/big_out; time scripts/docker_run.sh /tmp/big /tmp/big_out_docker
+          rm -rf /tmp/big_out; time CPUS=$(nproc) MEM=12g scripts/docker_run.sh /tmp/big /tmp/big_out_docker
           oracle/target/release/oracle /tmp/big /tmp/big_ref
           cd scripts && python3 compare.py /tmp/big_out_docker /tmp/big_ref
